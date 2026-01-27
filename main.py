@@ -3,7 +3,7 @@ from src.auth.authenticator import render_login, logout
 from src.ui.admin_dashboard import render_admin
 from src.ui.sales_dashboard import render_sales
 
-# 1. Configuración de página (Debe ser lo primero)
+# 1. Configuración de página
 st.set_page_config(
     page_title="Infinity Solutions Manager", 
     page_icon="🚀", 
@@ -11,44 +11,61 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 2. CSS FORZADO (ESTILO CORPORATIVO DARK MODE)
-# Esto corrige el problema de Brave/Opera unificando colores
+# 2. CSS FORZADO (TEMA CLARO / LIGHT MODE)
 st.markdown("""
     <style>
         /* Fondo Principal */
         .stApp {
-            background-color: #0E1117;
-            color: #FAFAFA;
+            background-color: #FFFFFF;
+            color: #31333F;
         }
+        
         /* Barras laterales */
         [data-testid="stSidebar"] {
-            background-color: #161B22;
+            background-color: #F8F9FB;
+            border-right: 1px solid #E0E0E0;
         }
-        /* Inputs y Textbox */
+        
+        /* Encabezados */
+        h1, h2, h3 {
+            color: #0E1117 !important;
+        }
+        
+        /* Inputs y Selectbox */
         .stTextInput > div > div > input, .stSelectbox > div > div > div {
-            background-color: #262730;
-            color: white;
-            border-color: #4B4B4C;
+            background-color: #FFFFFF;
+            color: #31333F;
+            border: 1px solid #D6D6D6;
         }
-        /* Métricas */
+        
+        /* Métricas (KPIs) */
         [data-testid="stMetricValue"] {
-            color: #00CC96 !important; /* Verde Neón para números */
+            color: #FF5722 !important; /* Naranja Infinity */
+            font-weight: bold;
         }
         [data-testid="stMetricLabel"] {
-            color: #E0E0E0 !important;
+            color: #555555 !important;
         }
-        /* Tablas */
-        [data-testid="stDataFrame"] {
-            background-color: #262730;
+        
+        /* Contenedores y Tarjetas */
+        [data-testid="stForm"] {
+            background-color: #F8F9FB;
+            border: 1px solid #E0E0E0;
+            padding: 20px;
+            border-radius: 10px;
         }
+        
         /* Botones Primarios */
         .stButton > button {
-            background-color: #FF4B4B;
+            background-color: #FF5722;
             color: white;
             border: none;
+            border-radius: 5px;
+            font-weight: bold;
         }
         .stButton > button:hover {
-            background-color: #FF2B2B;
+            background-color: #E64A19;
+            color: white;
         }
     </style>
 """, unsafe_allow_html=True)
@@ -62,9 +79,10 @@ def main():
     if user:
         # Sidebar común
         with st.sidebar:
-            st.image("https://cdn-icons-png.flaticon.com/512/1055/1055644.png", width=50)
-            st.title(f"📍 {user['branch']}")
-            st.write(f"👤 {user['full_name']}")
+            # Logo (puedes poner tu URL real aquí)
+            st.markdown("## ♾️ Infinity Manager") 
+            st.caption(f"📍 Sucursal: {user['branch']}")
+            st.write(f"👤 **{user['full_name']}**")
             st.divider()
             if st.button("Cerrar Sesión", type="secondary"):
                 logout()
