@@ -1,0 +1,11 @@
+.stApp {
+    background-color: #0e1117;
+}
+h1, h2, h3 {
+    color: #ffffff;
+}
+.stButton>button {
+    background-color: #FF4B4B;
+    color: white;
+    border-radius: 8px;
+}

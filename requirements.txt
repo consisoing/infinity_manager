@@ -1,0 +1,8 @@
+streamlit
+pandas
+plotly
+supabase
+python-dotenv
+fpdf
+openpyxl
+kaleido==0.2.1
