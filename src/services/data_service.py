@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import streamlit as st
 from datetime import datetime
 from src.config.connection import init_connection
 
@@ -7,14 +8,10 @@ from src.config.connection import init_connection
 supabase = init_connection()
 
 # ==============================================================================
-# 1. AUTENTICACIÓN Y SEGURIDAD
+# 1. AUTENTICACIÓN
 # ==============================================================================
 
 def login_user(username, password):
-    """
-    Verifica las credenciales del usuario en la base de datos.
-    Retorna el objeto de usuario si es exitoso, o None si falla.
-    """
     try:
         response = supabase.table("users").select("*").eq("username", username).eq("password", password).execute()
         if response.data:
@@ -25,52 +22,76 @@ def login_user(username, password):
         return None
 
 def verify_user_password(username, password):
-    """
-    Función auxiliar para re-verificar la contraseña antes de una acción crítica
-    (como editar o borrar un registro).
-    """
     return login_user(username, password) is not None
 
 def verify_admin_password(input_password, current_user_password):
-    """
-    Verifica si la contraseña ingresada coincide con la del administrador actual.
-    """
     return input_password == current_user_password
 
 # ==============================================================================
-# 2. LECTURA DE DATOS (READ)
+# 2. LECTURA DE DATOS (CON AUTOCORRECCIÓN DE SUCURSAL)
 # ==============================================================================
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_sales_data(user_role, user_branch, filter_branch=None, start_date=None, end_date=None):
     """
-    Obtiene el historial de ventas y actividades aplicando filtros de seguridad.
-    - Si es Vendedor: Solo ve su sucursal.
-    - Si es Admin: Puede ver todo o filtrar por sucursal.
+    Obtiene datos de ventas con corrección automática de sucursal basada en Referencia.
     """
     query = supabase.table("sales_log").select("*")
     
-    # 1. Filtro de Rol (Seguridad)
-    if user_role == 'sales':
-        query = query.eq('branch', user_branch)
-    elif user_role == 'admin':
-        if filter_branch and filter_branch != "Todas":
-            query = query.eq('branch', filter_branch)
-            
-    # 2. Filtro de Fechas (Rango)
+    # Filtro de fecha en SQL (Eficiente)
     if start_date and end_date:
         query = query.gte('created_at', start_date).lte('created_at', end_date)
     
-    # Ordenar: Más reciente primero
-    query = query.order('created_at', desc=True)
+    # Rango amplio
+    query = query.order('created_at', desc=True).range(0, 100000)
     
     response = query.execute()
-    return pd.DataFrame(response.data)
+    df = pd.DataFrame(response.data)
+    
+    if df.empty: return df
 
+    # --- AUTOCORRECCIÓN DE SUCURSAL ---
+    # Si la sucursal está mal, usamos el ID de referencia para corregirla en memoria
+    # Ej: BARIN/OUT/03533 -> Barinas
+    
+    def fix_branch(row):
+        current_branch = str(row['branch']).lower()
+        ref_id = str(row['reference_id']).upper()
+        
+        # Si ya coincide, dejarlo
+        if user_role == 'sales' and str(user_branch).lower() in current_branch:
+            return row['branch']
+        
+        # Rescate por Código
+        if "BARIN" in ref_id: return "Barinas"
+        if "MERID" in ref_id: return "Merida"
+        if "VIGIA" in ref_id: return "Vigia"
+        if "CARAC" in ref_id: return "Caracas"
+        if "VALEN" in ref_id: return "Valencia"
+        
+        return row['branch']
+
+    # Aplicar corrección solo si hay referencias
+    if 'reference_id' in df.columns:
+        df['branch'] = df.apply(fix_branch, axis=1)
+
+    # Convertir a minúsculas para filtrado seguro
+    df['branch_norm'] = df['branch'].astype(str).str.strip().str.lower()
+
+    # --- FILTRADO FINAL ---
+    if user_role == 'sales':
+        target = str(user_branch).strip().lower()
+        df = df[df['branch_norm'].str.contains(target, na=False)]
+        
+    elif user_role == 'admin':
+        if filter_branch and filter_branch != "Todas":
+            target = str(filter_branch).strip().lower()
+            df = df[df['branch_norm'].str.contains(target, na=False)]
+            
+    return df
+
+@st.cache_data(ttl=300, show_spinner=False)
 def get_branch_goal(branch):
-    """
-    Obtiene TODAS las metas configuradas para una sucursal específica.
-    Retorna un diccionario con valores por defecto si no existen.
-    """
     try:
         response = supabase.table("goals").select("*").eq("branch", branch).execute()
         if response.data:
@@ -81,337 +102,306 @@ def get_branch_goal(branch):
                 "meetings": int(data.get('meetings_goal', 40)),
                 "products": int(data.get('products_goal', 100))
             }
-        # Valores por defecto (Fallback)
-        return {
-            "amount": 10000.0, 
-            "clients": 20, 
-            "meetings": 40, 
-            "products": 100
-        }
+        return {"amount": 10000.0, "clients": 20, "meetings": 40, "products": 100}
     except Exception as e:
-        print(f"Error fetching goals: {e}")
         return {"amount": 10000.0, "clients": 20, "meetings": 40, "products": 100}
 
 def get_inventory_match_data(start_date, end_date):
-    """
-    Función especializada para la Auditoría.
-    Descarga toda la data del periodo y separa en dos DataFrames:
-    1. Ventas (Facturación)
-    2. Inventario (Logística)
-    """
     try:
-        query = supabase.table("sales_log").select("*").gte('created_at', start_date).lte('created_at', end_date)
+        query = supabase.table("sales_log").select("*").gte('created_at', start_date).lte('created_at', end_date).range(0, 100000)
         response = query.execute()
         df = pd.DataFrame(response.data)
-        
-        if df.empty: 
-            return pd.DataFrame(), pd.DataFrame()
-        
-        # Separar por tipo de actividad
+        if df.empty: return pd.DataFrame(), pd.DataFrame()
         ventas = df[df['activity_type'] == 'Venta'].copy()
-        
-        # Para inventario, buscamos todo lo que sea logística o movimientos de almacén
-        # (Usamos str.contains para ser flexibles)
-        inventario = df[
-            df['activity_type'].str.contains("Logística|Inventario|Entrega", na=False) |
-            (df['username'] == 'Almacén')
-        ].copy()
-        
+        inventario = df[df['activity_type'].str.contains("Logística|Inventario|Entrega", na=False) | (df['username'] == 'Almacén')].copy()
         return ventas, inventario
     except Exception as e:
-        print(f"Error en Match: {e}")
         return pd.DataFrame(), pd.DataFrame()
 
 # ==============================================================================
-# 3. ESCRITURA Y ACTUALIZACIÓN (CREATE / UPDATE)
+# 3. ESCRITURA
 # ==============================================================================
 
 def log_activity(username, branch, client, amount, desc, activity_type, tag, quantity=1):
-    """
-    Registra una nueva actividad desde el dashboard del vendedor.
-    """
     data = {
-        "username": username,
-        "branch": branch,
-        "client_name": client,
-        "amount": amount,
-        "description": desc,
-        "activity_type": activity_type,
-        "strategic_tag": tag,
-        "quantity": quantity,
-        "created_at": datetime.now().isoformat()
+        "username": username, "branch": branch, "client_name": client,
+        "amount": amount, "description": desc, "activity_type": activity_type,
+        "strategic_tag": tag, "quantity": quantity, "created_at": datetime.now().isoformat()
     }
     supabase.table("sales_log").insert(data).execute()
+    st.cache_data.clear()
 
 def update_branch_goal(branch, amount, clients, meetings, products):
-    """
-    Actualiza o Crea las 4 metas para una sucursal.
-    """
     try:
-        data = {
-            "branch": branch, 
-            "amount": amount,
-            "clients_goal": clients,
-            "meetings_goal": meetings,
-            "products_goal": products
-        }
-        # Upsert: Si existe actualiza, si no existe crea
+        data = {"branch": branch, "amount": amount, "clients_goal": clients, "meetings_goal": meetings, "products_goal": products}
         supabase.table("goals").upsert(data).execute()
+        st.cache_data.clear()
         return True
-    except Exception as e:
-        print(f"Error actualizando metas: {e}")
-        return False
+    except Exception as e: return False
 
 def update_sales_record(record_id, updates):
-    """
-    Actualiza campos específicos de un registro existente.
-    """
     try:
         supabase.table("sales_log").update(updates).eq("id", record_id).execute()
-        return True, "Registro actualizado correctamente."
-    except Exception as e:
-        return False, f"Error al actualizar: {str(e)}"
+        st.cache_data.clear()
+        return True, "Registro actualizado."
+    except Exception as e: return False, f"Error: {str(e)}"
 
 def update_own_record(record_id, updates):
-    """Wrapper para que el vendedor actualice sus propios registros"""
     return update_sales_record(record_id, updates)
 
-# ==============================================================================
-# 4. BORRADO DE DATOS (DELETE - ZONA DE PELIGRO)
-# ==============================================================================
-
 def delete_sales_record(record_id):
-    """Elimina un solo registro por ID"""
     try:
         supabase.table("sales_log").delete().eq("id", record_id).execute()
+        st.cache_data.clear()
         return True, "Registro eliminado."
     except Exception as e: return False, str(e)
 
 def delete_bulk_sales_records(list_ids):
-    """
-    Elimina múltiples registros a la vez.
-    Recibe una lista de IDs [1, 2, 5, ...]
-    """
     try:
-        if not list_ids: return False, "No seleccionaste nada."
-        # Usamos el filtro 'in_' de Supabase
+        if not list_ids: return False, "Nada seleccionado."
         supabase.table("sales_log").delete().in_("id", list_ids).execute()
+        st.cache_data.clear()
         return True, f"Se eliminaron {len(list_ids)} registros."
     except Exception as e: return False, str(e)
 
 def delete_all_data(target_branch=None):
-    """
-    BOTÓN NUCLEAR: Elimina todos los datos.
-    Si target_branch es 'Todas', borra la tabla completa.
-    Si es una sucursal, borra solo esa sucursal.
-    """
     try:
         query = supabase.table("sales_log").delete()
-        
         if target_branch and target_branch != "Todas":
             query = query.eq("branch", target_branch)
         else:
-            # Truco para borrar todo (where id is not null)
-            query = query.neq("id", -1) 
-            
+            query = query.neq("id", -1)
         query.execute()
+        st.cache_data.clear()
         return True, "Datos eliminados masivamente."
     except Exception as e: return False, str(e)
 
 # ==============================================================================
-# 5. CARGA MASIVA INTELIGENTE (LOGICA DE NEGOCIO ERP)
+# 5. CARGA MASIVA
 # ==============================================================================
 
 def smart_process_excel(df, default_branch):
-    """
-    Procesa archivos Excel/CSV detectando automáticamente el formato.
-    Soporta: Ventas, Inventario, Contactos.
-    Reconoce sucursales: Vigia, Barinas, Caracas, Valencia, Merida, Anzoategui.
-    """
     records = []
-    
-    # 1. Limpieza inicial de cabeceras
+    if len(df.columns) == 1 and ";" in str(df.iloc[0,0]):
+        try:
+            col_name = df.columns[0]
+            new_cols = col_name.split(";")
+            df = df[col_name].str.split(";", expand=True)
+            df.columns = new_cols
+        except: pass
+
+    df = df.astype(str)
     df.columns = [str(c).strip() for c in df.columns]
-    # Reemplazar NaN con None para JSON
-    df = df.replace({np.nan: None})
+    df = df.replace({'nan': None, 'NaN': None, '': None})
     headers = list(df.columns)
     
-    print(f"🔍 Analizando columnas: {headers}")
+    contact_keywords = ["translated display name", "job position", "nombre a mostrar", "etiquetas/nombre de etiqueta"]
+    headers_lower = [h.lower() for h in headers]
+    if any(k in headers_lower for k in contact_keywords):
+        return False, "⚠️ ERROR: Estás subiendo CONTACTOS en la pestaña de VENTAS. Por favor ve a la pestaña '👥 Fichas Clientes'."
 
-    # --- MAPEO DE SUCURSALES (DICCIONARIO EXTENDIDO) ---
     branch_map = {
-        # El Vigía
         "El Vigía": "Vigia", "El Vigia": "Vigia", "Vigia": "Vigia",
-        # Barinas
-        "Barinas": "Barinas", 
-        # Caracas
-        "Caracas": "Caracas", "Distrito Capital": "Caracas",
-        # Valencia
+        "Barinas": "Barinas", "Caracas": "Caracas", "Distrito Capital": "Caracas",
         "Valencia": "Valencia", "Carabobo": "Valencia",
-        # Mérida
-        "Merida": "Merida", "Mérida": "Merida", "Ejido": "Merida", "Andes": "Merida",
-        # Anzoátegui
-        "Anzoategui": "Anzoategui", "Anzoátegui": "Anzoategui", 
-        "Barcelona": "Anzoategui", "Puerto La Cruz": "Anzoategui", "Lecheria": "Anzoategui", "Oriente": "Anzoategui"
+        "Merida": "Merida", "Mérida": "Merida", "Ejido": "Merida",
+        "Anzoategui": "Anzoategui", "Anzoátegui": "Anzoategui", "Barcelona": "Anzoategui", "Puerto La Cruz": "Anzoategui"
     }
 
     def get_row_branch(row_val):
-        """Busca palabras clave en el texto para asignar la sucursal"""
-        if not row_val: return default_branch
+        if not row_val: return None
         val_str = str(row_val).strip()
-        
         for key, code in branch_map.items():
-            if key.lower() in val_str.lower():
-                return code
-        return default_branch
+            if key.lower() in val_str.lower(): return code
+        return None
 
     def clean_money(val):
-        """Convierte texto de moneda ($ 1.200,00) a float (1200.00)"""
-        if val is None or str(val).strip() == '': return 0.0
-        
-        # Si ya es número
-        if isinstance(val, (int, float)): return float(val)
-        
+        if val is None or str(val).strip() == '' or str(val).lower() == 'none': return 0.0
         s_val = str(val).replace('$', '').replace('Bs', '').strip()
-        
-        # Formato europeo/latino: 1.500,50
-        if ',' in s_val and '.' in s_val:
-            s_val = s_val.replace('.', '')  # Quitar miles
-            s_val = s_val.replace(',', '.') # Poner punto decimal
-        elif ',' in s_val:
-            s_val = s_val.replace(',', '.')
-        
+        if ',' in s_val:
+            if '.' in s_val: s_val = s_val.replace('.', '') 
+            s_val = s_val.replace(',', '.') 
         try: return float(s_val)
         except: return 0.0
 
-    # ---------------------------------------------------------
-    # ESCENARIO A: ARCHIVO DE VENTAS (PEDIDOS)
-    # ---------------------------------------------------------
-    if "Referencia del pedido" in headers and "Total" in headers:
-        print("✅ MODO: Carga de Ventas (Facturación)")
-        for _, row in df.iterrows():
-            # Detectar Sucursal
-            actual_branch = default_branch
-            if 'Almacén' in headers:
-                # Si el usuario eligió "Detectar Automático" (None), usamos la columna
-                if default_branch is None:
-                    actual_branch = get_row_branch(row.get('Almacén'))
-                else:
-                    actual_branch = default_branch
+    last_valid_branch = default_branch
 
-            monto = clean_money(row.get('Total'))
-            ref_id = str(row.get('Referencia del pedido', '')).strip()
+    # Lógica VENTAS
+    if "Referencia del pedido" in headers and "Total" in headers:
+        for _, row in df.iterrows():
+            detected = None
+            if 'Almacén' in headers and row.get('Almacén'):
+                 detected = get_row_branch(row.get('Almacén'))
             
-            # Fecha
-            try: fecha = pd.to_datetime(row.get('Fecha de creación')).isoformat()
+            if detected: last_valid_branch = detected; actual_branch = detected
+            elif last_valid_branch: actual_branch = last_valid_branch
+            else: actual_branch = "Vigia"
+
+            try: 
+                raw_date = row.get('Fecha de creación')
+                fecha = pd.to_datetime(raw_date).isoformat()
             except: fecha = datetime.now().isoformat()
 
             records.append({
-                "branch": actual_branch,
-                "created_at": fecha,
+                "branch": actual_branch, "created_at": fecha,
                 "client_name": str(row.get('Cliente') or 'Desconocido'),
-                "activity_type": "Venta",
-                "amount": monto,
-                "quantity": 1,
-                "description": f"Ref: {ref_id} | Estado: {row.get('Estado')}",
-                "reference_id": ref_id,
-                "strategic_tag": "Mantenimiento",
+                "activity_type": "Venta", 
+                "amount": clean_money(row.get('Total')),
+                "quantity": 1, 
+                "description": f"Ref: {row.get('Referencia del pedido')} | Estado: {row.get('Estado')}",
+                "reference_id": str(row.get('Referencia del pedido')), 
+                "strategic_tag": "Mantenimiento", 
                 "username": str(row.get('Comercial', 'Carga Masiva'))
             })
-
-    # ---------------------------------------------------------
-    # ESCENARIO B: ARCHIVO DE INVENTARIO (PRODUCTOS)
-    # ---------------------------------------------------------
+        mode_msg = "Ventas"
+    
+    # Lógica INVENTARIO
     elif "Producto" in headers and "Realizado" in headers:
-        print("✅ MODO: Carga de Inventario")
         for _, row in df.iterrows():
-            qty = clean_money(row.get('Realizado'))
+            detected = None
+            hints = str(row.get('Referencia', '')) + " " + str(row.get('Desde', ''))
+            detected = get_row_branch(hints)
             
-            # Detectar Sucursal
-            actual_branch = default_branch
-            if default_branch is None:
-                # Concatenamos varios campos para buscar pistas de la ciudad
-                pistas = str(row.get('Referencia', '')) + " " + str(row.get('Desde', ''))
-                actual_branch = get_row_branch(pistas)
-
+            if detected: last_valid_branch = detected; actual_branch = detected
+            elif last_valid_branch: actual_branch = last_valid_branch
+            else: actual_branch = "Vigia"
+            
             try: fecha = pd.to_datetime(row.get('Fecha')).isoformat()
             except: fecha = datetime.now().isoformat()
             
-            # Limpieza del nombre del producto
             prod_name = str(row.get('Producto', 'Sin Nombre'))
-            # Quitar corchetes iniciales si existen ej: [AC8]
-            if "]" in prod_name:
-                prod_name = prod_name.split("]", 1)[1].strip()
-
-            records.append({
-                "branch": actual_branch,
-                "created_at": fecha,
-                "client_name": str(row.get('Contacto/Nombre') or 'Stock Interno'),
-                "activity_type": "Logística/Entrega",
-                "amount": 0.0, # Inventario no suma dinero aquí
-                "quantity": int(qty),
-                "description": f"{prod_name} | SN: {row.get('Lote/Nº de serie')}",
-                "reference_id": str(row.get('Referencia', '')),
-                "strategic_tag": "Operativo",
-                "username": "Almacén"
-            })
-
-    # ---------------------------------------------------------
-    # ESCENARIO C: BASE DE CONTACTOS
-    # ---------------------------------------------------------
-    elif "Translated Display Name" in headers or "Compañía" in headers:
-        print("✅ MODO: Carga de Contactos")
-        for _, row in df.iterrows():
-            cli = row.get('Translated Display Name') or row.get('Compañía')
+            if "]" in prod_name: prod_name = prod_name.split("]", 1)[1].strip()
             
-            actual_branch = default_branch
-            if default_branch is None:
-                pistas = str(row.get('Estado', '')) + " " + str(row.get('Ciudad', ''))
-                actual_branch = get_row_branch(pistas)
-
             records.append({
-                "branch": actual_branch,
-                "created_at": datetime.now().isoformat(),
-                "client_name": str(cli),
-                "activity_type": "Registro Cliente",
-                "amount": 0.0,
-                "quantity": 0,
-                "description": f"Email: {row.get('Correo electrónico')}",
-                "strategic_tag": "Prospección",
-                "username": "Admin"
+                "branch": actual_branch, "created_at": fecha,
+                "client_name": str(row.get('Contacto/Nombre') or 'Stock Interno'),
+                "activity_type": "Logística/Entrega", "amount": 0.0,
+                "quantity": int(clean_money(row.get('Realizado'))),
+                "description": f"{prod_name} | SN: {row.get('Lote/Nº de serie')}",
+                "reference_id": str(row.get('Referencia')), "strategic_tag": "Operativo", "username": "Almacén"
             })
+        mode_msg = "Inventario"
     
-    # ---------------------------------------------------------
-    # ESCENARIO D: GENÉRICO
-    # ---------------------------------------------------------
     else:
-        print("⚠️ MODO: Genérico (Fallback)")
-        for _, row in df.iterrows():
-            records.append({
-                "branch": default_branch if default_branch else "Vigia",
-                "created_at": datetime.now().isoformat(),
-                "client_name": str(row.get(df.columns[0]) or 'Sin Nombre'),
-                "activity_type": "Carga Genérica",
-                "amount": 0.0,
-                "quantity": 1,
-                "description": "Carga manual sin formato reconocido",
-                "strategic_tag": "General",
-                "username": "Admin"
-            })
+        return False, f"⚠️ Formato no reconocido. Columnas: {headers[:3]}..."
 
-    # =========================================================
-    # INSERCIÓN FINAL EN BASE DE DATOS
-    # =========================================================
     if records:
         try:
-            # Insertar en lotes de 100 para estabilidad
             chunk_size = 100
             for i in range(0, len(records), chunk_size):
-                chunk = records[i:i + chunk_size]
-                supabase.table("sales_log").insert(chunk).execute()
-            
-            return True, f"Proceso Exitoso: {len(records)} registros cargados."
-        except Exception as e:
-            return False, f"Error de Base de Datos: {str(e)}"
+                supabase.table("sales_log").insert(records[i:i + chunk_size]).execute()
+            st.cache_data.clear() 
+            return True, f"✅ Carga de {mode_msg} Exitosa: {len(records)} registros."
+        except Exception as e: return False, f"Error DB: {str(e)}"
     
-    return False, "El archivo está vacío o no se reconocieron datos."
+    return False, "Archivo vacío."
+
+# ==============================================================================
+# 6. CRM
+# ==============================================================================
+
+def get_all_customer_profiles(branch=None):
+    all_records = []
+    chunk_size = 1000
+    offset = 0
+    query = supabase.table("customer_profiles").select("*")
+    if branch and branch != "Todas": query = query.eq("branch", branch)
+    while True:
+        response = query.range(offset, offset + chunk_size - 1).execute()
+        data_chunk = response.data
+        if not data_chunk: break
+        all_records.extend(data_chunk)
+        if len(data_chunk) < chunk_size: break
+        offset += chunk_size
+    return pd.DataFrame(all_records)
+
+def smart_import_profiles(df, branch_default):
+    stats = {"nuevos": 0, "actualizados": 0, "sin_cambios": 0}
+    df = df.astype(str)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    
+    col_map = {'nombre': ['nombre a mostrar', 'translated display name', 'display name', 'compañía', 'nombre', 'cliente'], 'email': ['correo electrónico', 'email', 'correo', 'mail'], 'phone': ['teléfono', 'phone', 'telefono', 'móvil', 'celular'], 'city': ['ciudad', 'city', 'población', 'estado'], 'category': ['etiquetas', 'tags', 'categoría', 'category']}
+
+    def find_col(options):
+        for opt in options:
+            if opt in df.columns: return opt
+        return None
+
+    c_name = find_col(col_map['nombre'])
+    c_email = find_col(col_map['email'])
+    c_phone = find_col(col_map['phone'])
+    c_city = find_col(col_map['city'])
+    c_cat = find_col(col_map['category'])
+
+    if not c_name: return False, f"Error: No encontré columna de Nombre."
+
+    existing_db = get_all_customer_profiles(branch_default)
+    existing_map = {}
+    if not existing_db.empty:
+        existing_db['norm_name'] = existing_db['name'].astype(str).str.strip().str.upper()
+        existing_map = existing_db.set_index('norm_name').to_dict('index')
+
+    inserts = []
+    
+    for _, row in df.iterrows():
+        raw_name = str(row[c_name]).strip()
+        if not raw_name or raw_name.lower() in ['nan', 'none', '', 'false']: continue
+        norm_name = raw_name.upper().replace("  ", " ")
+        
+        def get_clean(col_name):
+            if not col_name: return None
+            val = str(row[col_name]).strip()
+            return None if val.lower() in ['nan', 'none', '', 'false'] else val
+
+        new_email = get_clean(c_email); new_phone = get_clean(c_phone); new_city = get_clean(c_city); new_cat = get_clean(c_cat) or "General"
+
+        if norm_name in existing_map:
+            current = existing_map[norm_name]
+            record_id = current.get('id', -1)
+            if record_id == -1: continue
+            changes = {}
+            if not current.get('email') and new_email: changes['email'] = new_email
+            if not current.get('phone') and new_phone: changes['phone'] = new_phone
+            if not current.get('city') and new_city: changes['city'] = new_city
+            if not current.get('category') and new_cat: changes['category'] = new_cat
+            if changes:
+                has_e = changes.get('email', current.get('email')); has_p = changes.get('phone', current.get('phone')); has_c = changes.get('city', current.get('city'))
+                changes['is_complete'] = bool(has_e and has_p and has_c)
+                try:
+                    supabase.table("customer_profiles").update(changes).eq("id", record_id).execute()
+                    stats["actualizados"] += 1
+                except: pass
+            else: stats["sin_cambios"] += 1
+        else:
+            is_comp = bool(new_email and new_phone and new_city)
+            inserts.append({"name": norm_name, "email": new_email, "phone": new_phone, "city": new_city, "category": new_cat, "branch": branch_default, "is_complete": is_comp, "first_seen_at": datetime.now().isoformat()})
+            existing_map[norm_name] = {"id": -1}
+
+    if inserts:
+        try:
+            chunk_size = 1000
+            for i in range(0, len(inserts), chunk_size):
+                supabase.table("customer_profiles").insert(inserts[i:i + chunk_size]).execute()
+            stats["nuevos"] += len(inserts)
+        except Exception as e: return False, f"Error insertando: {str(e)}"
+            
+    st.cache_data.clear()
+    return True, f"Proceso CRM Terminado: {stats['nuevos']} Nuevos | {stats['actualizados']} Fichas Mejoradas"
+
+def delete_bulk_profiles(list_ids):
+    try:
+        if not list_ids: return False, "No seleccionaste nada."
+        supabase.table("customer_profiles").delete().in_("id", list_ids).execute()
+        st.cache_data.clear()
+        return True, f"Se eliminaron {len(list_ids)} contactos."
+    except Exception as e: return False, str(e)
+
+def delete_all_profiles(target_branch=None):
+    try:
+        query = supabase.table("customer_profiles").delete()
+        if target_branch and target_branch != "Todas": query = query.eq("branch", target_branch)
+        else: query = query.neq("id", -1)
+        query.execute()
+        st.cache_data.clear()
+        return True, "Base de contactos limpiada."
+    except Exception as e: return False, str(e)
